@@ -1,0 +1,474 @@
+// ==UserScript==
+// @name         Etsy Auto Lister v4.0 (With SKU Support)
+// @namespace    http://tampermonkey.net/
+// @version      4.0
+// @description  CSV: Col1=SKU, Col2=Title, Col3=Tags, Col4+=Images. Up ảnh -> SKU -> Title -> Tags -> Publish.
+// @author       HaiTrinh
+// @match        https://www.etsy.com/your/shops/me/tools/listings*
+// @match        https://www.etsy.com/your/shops/me/listing-editor/*
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- CẤU HÌNH ---
+    const CONFIG = {
+        delay: {
+            step: 800,
+            load: 5000,
+            typing: 20, // Tốc độ gõ phím chung
+            tagWait: 2000,
+            uploadWait: 15000,
+        },
+        random: {
+            sku: [300, 800],
+            title: [500, 1500],
+            tags: [500, 1500],
+            images: [1000, 3000],
+            nextListing: [3000, 5000]
+        },
+        selectors: {
+            // SKU Selectors
+            skuSection: '#field-sku',
+            skuAddBtn: '#field-sku button', // Nút Add SKU
+            skuInput: '#listing-sku-input', // Ô điền SKU
+
+            titleInput: '#listing-title-input',
+            tagSection: '#field-tags',
+            tagInput: '#listing-tags-input',
+            tagAddBtn: '#listing-tags-button',
+            fileInput: 'input[name="listing-media-upload"]',
+            imageContainer: '#field-image',
+            publishBtn: 'button[data-testid="publish"]',
+            confirmXPath: '/html/body/div[8]/div[2]/div/div[15]/div/div[3]/div[2]/button',
+            errorSummary: 'p[data-error-summary="true"]',
+            photoErrorLink: 'a[href*="listingImages"]'
+        }
+    };
+
+    // --- STATE ---
+    const STATE = {
+        get isRunning() { return GM_getValue('isRunning', false); },
+        set isRunning(val) { GM_setValue('isRunning', val); },
+        get currentIndex() { return GM_getValue('currentIndex', 0); },
+        set currentIndex(val) { GM_setValue('currentIndex', val); },
+        get templateId() { return GM_getValue('templateId', ''); },
+        set templateId(val) { GM_setValue('templateId', val); },
+        get csvData() { return JSON.parse(localStorage.getItem('etsy_csv_rows') || '[]'); },
+        set csvData(val) { localStorage.setItem('etsy_csv_rows', JSON.stringify(val)); }
+    };
+
+    // --- UI PANEL ---
+    function createPanel() {
+        if (document.getElementById('etsy-auto-panel')) return;
+        const panel = document.createElement('div');
+        panel.id = 'etsy-auto-panel';
+        panel.innerHTML = `
+            <div class="header">
+                <span>Etsy Auto v4.0 (Has SKU)</span>
+                <button id="ea-minimize-btn">_</button>
+            </div>
+            <div id="ea-content">
+                <div class="section">
+                    <label>Template ID:</label>
+                    <input type="text" id="ea-template-id" value="${STATE.templateId}" placeholder="VD: 123456789">
+                </div>
+                <div class="section">
+                    <label>CSV (SKU, Title, Tags, Imgs):</label>
+                    <input type="file" id="ea-csv-file" accept=".csv">
+                </div>
+                <div class="controls">
+                    <button id="ea-load-btn" class="btn-blue">Load CSV</button>
+                    <button id="ea-start-btn" class="btn-green">Start</button>
+                    <button id="ea-stop-btn" class="btn-red">Stop</button>
+                </div>
+                <div class="controls">
+                    <button id="ea-clear-btn" class="btn-gray">🗑️ Clear Data</button>
+                </div>
+                <div class="status-box">
+                    Item: <span id="ea-row-info" style="color:red; font-size:14px; font-weight:bold">${STATE.currentIndex + 1}</span> / ${STATE.csvData.length}
+                    <div id="ea-status">Ready...</div>
+                </div>
+                <div class="section">
+                    <label>Logs:</label>
+                    <textarea id="ea-logs" readonly></textarea>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+        GM_addStyle(`
+            #etsy-auto-panel { position: fixed; top: 10px; right: 10px; width: 300px; background: #fff; border: 2px solid #333; z-index: 999999; font-family: sans-serif; font-size: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); border-radius: 8px; overflow: hidden; }
+            #etsy-auto-panel .header { background: #2c3e50; color: #fff; padding: 8px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }
+            #ea-minimize-btn { background: #444; border: 1px solid #fff; color: white; width: 25px; height: 25px; cursor: pointer; border-radius: 4px; line-height: 1; padding: 0; }
+            #etsy-auto-panel .section { padding: 8px 10px; border-bottom: 1px solid #eee; }
+            #etsy-auto-panel label { display: block; font-weight: bold; margin-bottom: 4px; }
+            #etsy-auto-panel input, #etsy-auto-panel textarea { width: 100%; box-sizing: border-box; padding: 5px; border: 1px solid #ccc; }
+            #etsy-auto-panel textarea { height: 80px; font-size: 10px; font-family: monospace; }
+            #etsy-auto-panel .controls { display: flex; gap: 5px; padding: 5px 10px; }
+            #etsy-auto-panel button { flex: 1; padding: 8px; color: white; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; }
+            .btn-blue { background: #007bff; } .btn-green { background: #28a745; } .btn-red { background: #dc3545; } .btn-gray { background: #6c757d; }
+            .status-box { background: #f8f9fa; padding: 8px; text-align: center; border-bottom: 1px solid #eee; }
+            #ea-status { color: #d63384; margin-top: 4px; font-weight: bold; }
+            .ea-minimized #ea-content { display: none; }
+        `);
+
+        document.getElementById('ea-template-id').addEventListener('change', (e) => STATE.templateId = e.target.value.trim());
+        document.getElementById('ea-load-btn').addEventListener('click', loadCSV);
+        document.getElementById('ea-start-btn').addEventListener('click', startProcess);
+        document.getElementById('ea-stop-btn').addEventListener('click', stopProcess);
+        document.getElementById('ea-clear-btn').addEventListener('click', clearData);
+
+        const minimizeBtn = document.getElementById('ea-minimize-btn');
+        minimizeBtn.addEventListener('click', () => {
+            const panelEl = document.getElementById('etsy-auto-panel');
+            panelEl.classList.toggle('ea-minimized');
+            minimizeBtn.innerText = panelEl.classList.contains('ea-minimized') ? '+' : '_';
+        });
+
+        updateUI();
+    }
+
+    function log(msg) {
+        const el = document.getElementById('ea-status');
+        const area = document.getElementById('ea-logs');
+        if (el && !document.getElementById('etsy-auto-panel').classList.contains('ea-minimized')) el.innerText = msg;
+        if (area) area.value = `> ${msg}\n` + area.value;
+        console.log(`[EtsyAuto] ${msg}`);
+    }
+
+    function updateUI() {
+        const el = document.getElementById('ea-row-info');
+        if (el && STATE.csvData.length > 0) el.innerText = `${STATE.currentIndex + 1}`;
+    }
+
+    // --- HÀM CHECK LỖI ---
+    function findConfirmButton() {
+        const overlayBtns = Array.from(document.querySelectorAll('div[role="dialog"] button, div[class*="overlay"] button'));
+        let targetBtn = overlayBtns.find(b => {
+            const txt = b.innerText.toLowerCase();
+            return (txt === 'publish' || txt === 'đăng' || txt === 'save' || txt === 'lưu') && b.offsetParent !== null;
+        });
+        if (targetBtn) return targetBtn;
+        const byId = document.querySelector('#shop-manager--listing-publish');
+        if(byId && byId.offsetParent !== null) return byId;
+        try {
+            const xpathResult = document.evaluate(CONFIG.selectors.confirmXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            if (xpathResult.singleNodeValue && xpathResult.singleNodeValue.offsetParent !== null) return xpathResult.singleNodeValue;
+        } catch(e) {}
+        return null;
+    }
+
+    function checkImageError() {
+        const errorSummary = document.querySelector(CONFIG.selectors.errorSummary);
+        const photoLink = document.querySelector(CONFIG.selectors.photoErrorLink);
+        if (errorSummary && photoLink && errorSummary.offsetParent !== null) return true;
+        return false;
+    }
+
+    // --- CSV PROCESSING ---
+    function loadCSV() {
+        const fileInput = document.getElementById('ea-csv-file');
+        if (!fileInput.files.length) return alert('Chưa chọn file CSV!');
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            STATE.csvData = parseCSV(e.target.result);
+            STATE.currentIndex = 0;
+            updateUI();
+            log(`Đã load ${STATE.csvData.length} dòng.`);
+        };
+        reader.readAsText(fileInput.files[0]);
+    }
+
+    function parseCSV(text) {
+        const lines = text.split(/\r\n|\n/);
+        const result = [];
+        for (let line of lines) {
+            if (!line.trim()) continue;
+            const regex = /(?:^|,)(\s*"([^"]*(?:""[^"]*)*)"|\s*([^,]*))/g;
+            let matches = [];
+            let match;
+            while (match = regex.exec(line)) {
+                let val = match[2] ? match[2].replace(/""/g, '"') : match[3];
+                matches.push(val ? val.trim() : '');
+            }
+            if (matches.length > 0 && matches[0]) {
+                // CẬP NHẬT CẤU TRÚC CỘT TẠI ĐÂY
+                result.push({
+                    sku: matches[0],       // Cột 1
+                    title: matches[1],     // Cột 2
+                    tags: matches[2] || '', // Cột 3
+                    images: matches.slice(3).filter(u => u.startsWith('http')) // Cột 4+
+                });
+            }
+        }
+        return result;
+    }
+
+    function clearData() {
+        if(confirm('Reset toàn bộ?')) {
+            STATE.csvData = [];
+            STATE.currentIndex = 0;
+            STATE.isRunning = false;
+            updateUI();
+            log('Đã xóa dữ liệu.');
+        }
+    }
+
+    // --- PROCESS LOGIC ---
+    function startProcess() {
+        if (!STATE.templateId || STATE.csvData.length === 0) return alert('Thiếu dữ liệu!');
+        STATE.isRunning = true;
+        checkAndRedirect();
+    }
+
+    function stopProcess() {
+        STATE.isRunning = false;
+        log('Đã dừng.');
+    }
+
+    function checkAndRedirect() {
+        if (!STATE.isRunning) return;
+        const currentUrl = window.location.href;
+        const copyUrl = `https://www.etsy.com/your/shops/me/listing-editor/copy/${STATE.templateId}`;
+
+        if (currentUrl.includes(copyUrl) || currentUrl.includes('/listing-editor/edit/')) {
+            const rows = STATE.csvData;
+            if (STATE.currentIndex >= rows.length) {
+                STATE.isRunning = false;
+                alert('Xong hết file CSV!');
+                return;
+            }
+            runFilling(rows[STATE.currentIndex]);
+        } else {
+            log('Đang ở Manager -> Chuyển bài tiếp theo...');
+            const nextDelay = getRandomMs(CONFIG.random.nextListing);
+            setTimeout(() => { if(STATE.isRunning) window.location.href = copyUrl; }, nextDelay);
+        }
+    }
+
+    async function runFilling(row) {
+        try {
+            updateUI();
+            log(`--- Bắt đầu dòng ${STATE.currentIndex + 1} [SKU: ${row.sku}] ---`);
+
+            // 1. TITLE
+            log('Điền Title...');
+            const titleInput = await waitForSelector(CONFIG.selectors.titleInput);
+            if (!titleInput) throw new Error('Mất tích ô Title');
+            await sleep(CONFIG.delay.load);
+            titleInput.focus();
+            await simulateTyping(titleInput, row.title, CONFIG.delay.typing);
+            titleInput.blur();
+            await sleep(getRandomMs(CONFIG.random.title));
+
+            // 2. SKU (LOGIC MỚI THÊM VÀO ĐÂY)
+            if (row.sku) {
+                log(`Điền SKU: ${row.sku}...`);
+                // Cuộn đến phần SKU
+                const skuSection = document.querySelector(CONFIG.selectors.skuSection);
+                if(skuSection) skuSection.scrollIntoView({ behavior: "smooth", block: "center" });
+                await sleep(1000);
+
+                // Kiểm tra xem input đã hiển thị chưa
+                let skuInput = document.querySelector(CONFIG.selectors.skuInput);
+                const skuBtn = document.querySelector(CONFIG.selectors.skuAddBtn);
+
+                // Nếu không thấy input hoặc nó bị ẩn, mà có nút Add -> Bấm nút Add
+                if (!skuInput || skuInput.offsetParent === null) {
+                    if (skuBtn) {
+                        log('Click mở nút Add SKU...');
+                        skuBtn.click();
+                        await sleep(800); // Chờ animation
+                    }
+                }
+
+                // Lấy lại input sau khi đã click
+                skuInput = await waitForSelector(CONFIG.selectors.skuInput, 3000);
+                if (skuInput) {
+                    skuInput.focus();
+                    skuInput.value = ''; // Xóa cũ nếu có
+                    await simulateTyping(skuInput, row.sku, CONFIG.delay.typing);
+                    skuInput.blur();
+                    await sleep(getRandomMs(CONFIG.random.sku));
+                } else {
+                    log('⚠️ Không tìm thấy ô nhập SKU, bỏ qua bước này.');
+                }
+            }
+
+            // 3. IMAGES
+            if (row.images?.length > 0) {
+                log(`Tải ${row.images.length} ảnh...`);
+                const imgContainer = document.querySelector(CONFIG.selectors.imageContainer) || document.querySelector('.wt-upload__area');
+                if (imgContainer) imgContainer.scrollIntoView({ behavior: "smooth", block: "center" });
+                await sleep(2000);
+                const files = await fetchImagesAsFiles(row.images);
+                if (files.length > 0) {
+                    await uploadFilesToEtsy(files);
+                    log(`Chờ ảnh load ${CONFIG.delay.uploadWait/1000}s...`);
+                    await sleep(CONFIG.delay.uploadWait);
+                    await sleep(getRandomMs(CONFIG.random.images));
+                }
+            }
+
+            // 4. TAGS
+            const tagSection = document.querySelector(CONFIG.selectors.tagSection);
+            if (tagSection) tagSection.scrollIntoView({ behavior: "smooth", block: "center" });
+            await sleep(1500);
+            const tagInput = document.querySelector(CONFIG.selectors.tagInput);
+            const tagAddBtn = document.querySelector(CONFIG.selectors.tagAddBtn);
+
+            if (row.tags && tagInput && tagAddBtn) {
+                const tagString = row.tags.split(',').map(t => t.trim()).filter(t => t).slice(0, 13).join(',');
+                log(`Nhập tags...`);
+                tagInput.focus();
+                tagInput.value = '';
+                await simulateTyping(tagInput, tagString, CONFIG.delay.typing);
+                await sleep(500);
+                tagInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+                await sleep(500);
+                tagAddBtn.click();
+                await sleep(CONFIG.delay.tagWait);
+            }
+            await sleep(getRandomMs(CONFIG.random.tags));
+
+            // 5. PUBLISH & RETRY LOGIC
+            log('Cuộn xuống nút Publish...');
+            window.scrollTo(0, document.body.scrollHeight);
+            await sleep(2000);
+
+            let mainPubBtn = await waitForSelector(CONFIG.selectors.publishBtn, 5000);
+            if (!mainPubBtn) throw new Error('Không thấy nút Publish chính');
+            log('🚀 Bắt đầu quy trình Publish...');
+
+            let attempts = 0;
+            const maxAttempts = 60;
+            let savedIndex = false;
+
+            while (attempts < maxAttempts) {
+                // A. Check Lỗi Ảnh
+                if (checkImageError()) {
+                    log('⚠️ LỖI ẢNH! Up lại...');
+                    const imgContainer = document.querySelector(CONFIG.selectors.imageContainer);
+                    if (imgContainer) imgContainer.scrollIntoView({ behavior: "smooth", block: "center" });
+                    await sleep(2000);
+                    log('♻️ Tải lại file...');
+                    const retryFiles = await fetchImagesAsFiles(row.images);
+                    if (retryFiles.length > 0) {
+                        await uploadFilesToEtsy(retryFiles);
+                        log('⏳ Chờ 15s...');
+                        await sleep(15000);
+                    }
+                    log('🔄 Quay lại nút Publish...');
+                    window.scrollTo(0, document.body.scrollHeight);
+                    attempts = 0;
+                    if (mainPubBtn) simulateClick(mainPubBtn);
+                    await sleep(3000);
+                    continue;
+                }
+
+                // B. Confirm Popup
+                const confirmBtn = findConfirmButton();
+                if (confirmBtn) {
+                    if (!savedIndex) {
+                        STATE.currentIndex = STATE.currentIndex + 1;
+                        savedIndex = true;
+                    }
+                    log(`👉 Click Confirm! (Lần ${attempts})`);
+                    simulateClick(confirmBtn);
+                } else {
+                    log(`🔎 Bấm nút Publish chính...`);
+                    mainPubBtn = document.querySelector(CONFIG.selectors.publishBtn);
+                    if (mainPubBtn) simulateClick(mainPubBtn);
+                }
+                await sleep(5000);
+                attempts++;
+            }
+
+            log('❌ Timeout Publish.');
+            STATE.isRunning = false;
+
+        } catch (e) {
+            console.error(e);
+            log('Lỗi: ' + e.message);
+            STATE.isRunning = false;
+        }
+    }
+
+    // --- HELPERS ---
+    function getRandomMs(range) { return Math.floor(Math.random() * (range[1] - range[0] + 1)) + range[0]; }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function simulateClick(element) {
+        if(!element) return;
+        element.focus();
+        element.click();
+        ['mousedown', 'mouseup', 'click'].forEach(evt => {
+            element.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: null }));
+        });
+    }
+
+    async function simulateTyping(input, text, speed) {
+        const proto = (input.tagName === 'TEXTAREA') ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+        for (let i = 1; i <= text.length; i++) {
+            setter.call(input, text.substring(0, i));
+            if(input._valueTracker) input._valueTracker.setValue('');
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            await new Promise(r => setTimeout(r, speed));
+        }
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function waitForSelector(selector, timeout = 10000) {
+        return new Promise(resolve => {
+            if (document.querySelector(selector)) return resolve(document.querySelector(selector));
+            const obs = new MutationObserver(() => {
+                if (document.querySelector(selector)) { resolve(document.querySelector(selector)); obs.disconnect(); }
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
+        });
+    }
+
+    async function fetchImagesAsFiles(urls) {
+        const promises = urls.map((url, i) => new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: "GET", url: url, responseType: "blob",
+                onload: r => resolve(r.status===200 ? new File([r.response], `img_${Date.now()}_${i}.jpg`, {type:"image/jpeg"}) : null),
+                onerror: () => resolve(null)
+            });
+        }));
+        return (await Promise.all(promises)).filter(f => f);
+    }
+
+    async function uploadFilesToEtsy(files) {
+        const inp = document.querySelector(CONFIG.selectors.fileInput);
+        if (!inp) return;
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // --- INIT ---
+    createPanel();
+    setInterval(() => {
+        if (STATE.isRunning && document.querySelector('body')) {
+            const currentUrl = window.location.href;
+            if (!currentUrl.includes('listing-editor') && !window.isRedirecting) {
+                window.isRedirecting = true;
+                setTimeout(() => {
+                     window.location.href = `https://www.etsy.com/your/shops/me/listing-editor/copy/${STATE.templateId}`;
+                }, 3000);
+            }
+        }
+    }, 2000);
+    window.addEventListener('load', () => { createPanel(); checkAndRedirect(); });
+
+})();
