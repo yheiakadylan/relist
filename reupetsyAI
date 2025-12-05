@@ -1,0 +1,547 @@
+// ==UserScript==
+// @name         Etsy Auto Lister v5.4 (Gemini 2.5 + Scroll Fix)
+// @namespace    http://tampermonkey.net/
+// @version      5.4
+// @description  CSV: Col1=SKU, Col2=Title, Col3=Tags, Col4+=Images. Logic: Scroll -> Sleep -> Action. Gemini Tags < 20 chars.
+// @author       HaiTrinh
+// @match        https://www.etsy.com/your/shops/me/tools/listings*
+// @match        https://www.etsy.com/your/shops/me/listing-editor/*
+// @connect      generativelanguage.googleapis.com
+// @connect      *
+// @grant        GM_addStyle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // --- CẤU HÌNH ---
+    const CONFIG = {
+        geminiModel: 'gemini-2.5-flash',
+        delay: {
+            step: 800,
+            load: 5000,
+            typing: 20,
+            tagWait: 2000,
+            uploadWait: 15000,
+        },
+        random: {
+            sku: [300, 800],
+            title: [500, 1500],
+            tags: [500, 1500],
+            images: [1000, 3000],
+            nextListing: [3000, 5000]
+        },
+        selectors: {
+            skuSection: '#field-sku',
+            skuAddBtn: '#field-sku button',
+            skuInput: '#listing-sku-input',
+            titleInput: '#listing-title-input',
+            tagSection: '#field-tags',
+            tagInput: '#listing-tags-input',
+            tagAddBtn: '#listing-tags-button',
+            fileInput: 'input[name="listing-media-upload"]',
+            imageContainer: '#field-image',
+            publishBtn: 'button[data-testid="publish"]',
+            confirmXPath: '/html/body/div[8]/div[2]/div/div[15]/div/div[3]/div[2]/button',
+            errorSummary: 'p[data-error-summary="true"]',
+            photoErrorLink: 'a[href*="listingImages"]'
+        }
+    };
+
+    // --- STATE ---
+    const STATE = {
+        get isRunning() { return GM_getValue('isRunning', false); },
+        set isRunning(val) { GM_setValue('isRunning', val); },
+        get currentIndex() { return GM_getValue('currentIndex', 0); },
+        set currentIndex(val) { GM_setValue('currentIndex', val); },
+        get templateId() { return GM_getValue('templateId', ''); },
+        set templateId(val) { GM_setValue('templateId', val); },
+        get apiKey() { return GM_getValue('geminiApiKey', ''); },
+        set apiKey(val) { GM_setValue('geminiApiKey', val); },
+        get csvData() { return JSON.parse(localStorage.getItem('etsy_csv_rows') || '[]'); },
+        set csvData(val) { localStorage.setItem('etsy_csv_rows', JSON.stringify(val)); }
+    };
+
+    // --- GEMINI API LOGIC ---
+    async function convertImageUrlToBase64(url) {
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: "GET", url: url, responseType: "blob",
+                onload: (res) => {
+                    if (res.status !== 200) { resolve(null); return; }
+                    const reader = new FileReader();
+                    reader.onloadend = () => {
+                        const base64data = reader.result.split(',')[1];
+                        resolve(base64data);
+                    };
+                    reader.readAsDataURL(res.response);
+                },
+                onerror: () => resolve(null)
+            });
+        });
+    }
+
+    async function generateTagsWithGemini(title, imageUrl) {
+        if (!STATE.apiKey) {
+            log('⚠️ Chưa nhập Gemini API Key!');
+            return '';
+        }
+
+        log(`🤖 Đang gọi Gemini 2.5...`);
+
+        // --- PROMPT ĐƯỢC CHỈNH SỬA (Giới hạn 20 ký tự) ---
+        let promptText = `
+        Act as an Etsy SEO expert. Analyze the product title: "${title}" and the attached image.
+        Generate exactly 13 high-search-volume tags.
+
+        CRITICAL RULES:
+        1. Each tag must be **UNDER 20 CHARACTERS** in length.
+        2. Return ONLY the tags, separated by commas.
+        3. Do NOT number the list.
+        4. Do NOT include any intro or outro text.
+        `;
+
+        let parts = [{ text: promptText }];
+
+        if (imageUrl) {
+            const base64Image = await convertImageUrlToBase64(imageUrl);
+            if (base64Image) {
+                parts.push({
+                    inline_data: { mime_type: "image/jpeg", data: base64Image }
+                });
+            }
+        }
+
+        const requestBody = {
+            contents: [{ parts: parts }],
+            generationConfig: { temperature: 0.7 },
+            safetySettings: [
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+            ]
+        };
+
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.geminiModel}:generateContent?key=${STATE.apiKey}`;
+
+        return new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: "POST", url: apiUrl, headers: { "Content-Type": "application/json" },
+                data: JSON.stringify(requestBody),
+                onload: (response) => {
+                    if (response.status === 200) {
+                        try {
+                            const result = JSON.parse(response.responseText);
+                            if (result.candidates && result.candidates[0].content) {
+                                let reply = result.candidates[0].content.parts[0].text;
+                                // Cleanup text
+                                reply = reply.replace(/\n/g, ',').replace(/\./g, '').trim();
+                                if(reply.endsWith(',')) reply = reply.slice(0, -1);
+
+                                log('✅ Gemini Tags: ' + reply.substring(0, 40) + '...');
+                                resolve(reply);
+                            } else {
+                                log('⚠️ Gemini trả về rỗng.');
+                                resolve('');
+                            }
+                        } catch (e) { log('❌ Lỗi JSON'); resolve(''); }
+                    } else {
+                        log(`❌ Lỗi API (${response.status})`);
+                        resolve('');
+                    }
+                },
+                onerror: () => { log('❌ Lỗi mạng.'); resolve(''); }
+            });
+        });
+    }
+
+    // --- UI PANEL ---
+    function createPanel() {
+        if (document.getElementById('etsy-auto-panel')) return;
+        const panel = document.createElement('div');
+        panel.id = 'etsy-auto-panel';
+        panel.innerHTML = `
+            <div class="header">
+                <span>Etsy Auto v5.4 (Scroll Fix)</span>
+                <button id="ea-minimize-btn">_</button>
+            </div>
+            <div id="ea-content">
+                <div class="section">
+                    <label>Template ID:</label>
+                    <input type="text" id="ea-template-id" value="${STATE.templateId}" placeholder="VD: 123456789">
+                </div>
+                 <div class="section">
+                    <label>Gemini API Key:</label>
+                    <input type="password" id="ea-api-key" value="${STATE.apiKey}" placeholder="Key...">
+                </div>
+                <div class="section">
+                    <label>CSV (SKU, Title, Tags, Imgs):</label>
+                    <input type="file" id="ea-csv-file" accept=".csv">
+                </div>
+                <div class="controls">
+                    <button id="ea-load-btn" class="btn-blue">Load CSV</button>
+                    <button id="ea-start-btn" class="btn-green">Start</button>
+                    <button id="ea-stop-btn" class="btn-red">Stop</button>
+                </div>
+                <div class="controls">
+                    <button id="ea-clear-btn" class="btn-gray">🗑️ Clear Data</button>
+                </div>
+                <div class="status-box">
+                    Item: <span id="ea-row-info" style="color:red; font-size:14px; font-weight:bold">${STATE.currentIndex + 1}</span> / ${STATE.csvData.length}
+                    <div id="ea-status">Ready...</div>
+                </div>
+                <div class="section">
+                    <label>Logs:</label>
+                    <textarea id="ea-logs" readonly></textarea>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+        GM_addStyle(`
+            #etsy-auto-panel { position: fixed; top: 10px; right: 10px; width: 300px; background: #fff; border: 2px solid #333; z-index: 999999; font-family: sans-serif; font-size: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); border-radius: 8px; overflow: hidden; }
+            #etsy-auto-panel .header { background: #fd7e14; color: #fff; padding: 8px; font-weight: bold; display: flex; justify-content: space-between; align-items: center; }
+            #ea-minimize-btn { background: #444; border: 1px solid #fff; color: white; width: 25px; height: 25px; cursor: pointer; border-radius: 4px; line-height: 1; padding: 0; }
+            #etsy-auto-panel .section { padding: 8px 10px; border-bottom: 1px solid #eee; }
+            #etsy-auto-panel label { display: block; font-weight: bold; margin-bottom: 4px; }
+            #etsy-auto-panel input, #etsy-auto-panel textarea { width: 100%; box-sizing: border-box; padding: 5px; border: 1px solid #ccc; }
+            #etsy-auto-panel textarea { height: 80px; font-size: 10px; font-family: monospace; }
+            #etsy-auto-panel .controls { display: flex; gap: 5px; padding: 5px 10px; }
+            #etsy-auto-panel button { flex: 1; padding: 8px; color: white; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; }
+            .btn-blue { background: #007bff; } .btn-green { background: #28a745; } .btn-red { background: #dc3545; } .btn-gray { background: #6c757d; }
+            .status-box { background: #f8f9fa; padding: 8px; text-align: center; border-bottom: 1px solid #eee; }
+            #ea-status { color: #d63384; margin-top: 4px; font-weight: bold; }
+            .ea-minimized #ea-content { display: none; }
+        `);
+
+        document.getElementById('ea-template-id').addEventListener('change', (e) => STATE.templateId = e.target.value.trim());
+        document.getElementById('ea-api-key').addEventListener('change', (e) => STATE.apiKey = e.target.value.trim());
+        document.getElementById('ea-load-btn').addEventListener('click', loadCSV);
+        document.getElementById('ea-start-btn').addEventListener('click', startProcess);
+        document.getElementById('ea-stop-btn').addEventListener('click', stopProcess);
+        document.getElementById('ea-clear-btn').addEventListener('click', clearData);
+        document.getElementById('ea-minimize-btn').addEventListener('click', () => {
+            const panelEl = document.getElementById('etsy-auto-panel');
+            panelEl.classList.toggle('ea-minimized');
+        });
+        updateUI();
+    }
+
+    function log(msg) {
+        const el = document.getElementById('ea-status');
+        const area = document.getElementById('ea-logs');
+        if (el && !document.getElementById('etsy-auto-panel').classList.contains('ea-minimized')) el.innerText = msg;
+        if (area) area.value = `> ${msg}\n` + area.value;
+        console.log(`[EtsyAuto] ${msg}`);
+    }
+
+    function updateUI() {
+        const el = document.getElementById('ea-row-info');
+        if (el && STATE.csvData.length > 0) el.innerText = `${STATE.currentIndex + 1}`;
+    }
+
+    // --- LOGIC CHÍNH ---
+    function loadCSV() {
+        const fileInput = document.getElementById('ea-csv-file');
+        if (!fileInput.files.length) return alert('Chưa chọn file CSV!');
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            STATE.csvData = parseCSV(e.target.result);
+            STATE.currentIndex = 0;
+            updateUI();
+            log(`Đã load ${STATE.csvData.length} dòng.`);
+        };
+        reader.readAsText(fileInput.files[0]);
+    }
+
+    function parseCSV(text) {
+        const lines = text.split(/\r\n|\n/);
+        const result = [];
+        for (let line of lines) {
+            if (!line.trim()) continue;
+            const regex = /(?:^|,)(\s*"([^"]*(?:""[^"]*)*)"|\s*([^,]*))/g;
+            let matches = [];
+            let match;
+            while (match = regex.exec(line)) {
+                let val = match[2] ? match[2].replace(/""/g, '"') : match[3];
+                matches.push(val ? val.trim() : '');
+            }
+            if (matches.length > 0 && matches[0]) {
+                result.push({
+                    sku: matches[0],
+                    title: matches[1],
+                    tags: matches[2] || '',
+                    images: matches.slice(3).filter(u => u.startsWith('http'))
+                });
+            }
+        }
+        return result;
+    }
+
+    function clearData() {
+        if(confirm('Reset toàn bộ?')) {
+            STATE.csvData = [];
+            STATE.currentIndex = 0;
+            STATE.isRunning = false;
+            updateUI();
+            log('Đã xóa dữ liệu.');
+        }
+    }
+
+    function startProcess() {
+        if (!STATE.templateId || STATE.csvData.length === 0) return alert('Thiếu dữ liệu!');
+        STATE.isRunning = true;
+        checkAndRedirect();
+    }
+
+    function stopProcess() { STATE.isRunning = false; log('Đã dừng.'); }
+
+    function checkAndRedirect() {
+        if (!STATE.isRunning) return;
+        const currentUrl = window.location.href;
+        const copyUrl = `https://www.etsy.com/your/shops/me/listing-editor/copy/${STATE.templateId}`;
+        if (currentUrl.includes(copyUrl) || currentUrl.includes('/listing-editor/edit/')) {
+            const rows = STATE.csvData;
+            if (STATE.currentIndex >= rows.length) {
+                STATE.isRunning = false;
+                alert('Xong hết file CSV!');
+                return;
+            }
+            runFilling(rows[STATE.currentIndex]);
+        } else {
+            log('Đang ở Manager -> Chuyển bài tiếp theo...');
+            setTimeout(() => { if(STATE.isRunning) window.location.href = copyUrl; }, getRandomMs(CONFIG.random.nextListing));
+        }
+    }
+
+    // --- HÀM ĐIỀN THÔNG TIN (ĐÃ KHÔI PHỤC SCROLL LOGIC) ---
+    async function runFilling(row) {
+        try {
+            updateUI();
+            log(`--- Bắt đầu dòng ${STATE.currentIndex + 1} [SKU: ${row.sku}] ---`);
+
+            // 1. TITLE
+            log('Điền Title...');
+            const titleInput = await waitForSelector(CONFIG.selectors.titleInput);
+            if (!titleInput) throw new Error('Mất tích ô Title');
+            await sleep(CONFIG.delay.load);
+            titleInput.focus();
+            await simulateTyping(titleInput, row.title, CONFIG.delay.typing);
+            titleInput.blur();
+            await sleep(getRandomMs(CONFIG.random.title));
+
+            // 2. SKU
+            if (row.sku) {
+                log(`Cuộn đến SKU...`);
+                // Scroll rõ ràng
+                const skuSection = document.querySelector(CONFIG.selectors.skuSection);
+                if(skuSection) {
+                    skuSection.scrollIntoView({ behavior: "smooth", block: "center" });
+                    await sleep(1500); // Ngủ để chờ scroll xong
+                }
+
+                log(`Điền SKU: ${row.sku}...`);
+                let skuInput = document.querySelector(CONFIG.selectors.skuInput);
+                const skuBtn = document.querySelector(CONFIG.selectors.skuAddBtn);
+
+                // Logic bấm nút Add
+                if (!skuInput || skuInput.offsetParent === null) {
+                    if (skuBtn) { skuBtn.click(); await sleep(800); }
+                }
+                skuInput = await waitForSelector(CONFIG.selectors.skuInput, 3000);
+                if (skuInput) {
+                    skuInput.focus(); skuInput.value = '';
+                    await simulateTyping(skuInput, row.sku, CONFIG.delay.typing);
+                    skuInput.blur();
+                    await sleep(getRandomMs(CONFIG.random.sku));
+                }
+            }
+
+            // 3. IMAGES
+            if (row.images?.length > 0) {
+                log(`Cuộn đến Ảnh...`);
+                const imgContainer = document.querySelector(CONFIG.selectors.imageContainer);
+                if (imgContainer) {
+                    imgContainer.scrollIntoView({ behavior: "smooth", block: "center" });
+                    await sleep(2000); // Ngủ chờ scroll
+                }
+
+                log(`Tải ${row.images.length} ảnh...`);
+                const files = await fetchImagesAsFiles(row.images);
+                if (files.length > 0) {
+                    await uploadFilesToEtsy(files);
+                    log(`⏳ Chờ ảnh load (${CONFIG.delay.uploadWait/1000}s)...`);
+                    await sleep(CONFIG.delay.uploadWait);
+                }
+            }
+
+            // 4. TAGS (GEMINI 2.5)
+            log(`Cuộn đến Tags...`);
+            const tagSection = document.querySelector(CONFIG.selectors.tagSection);
+            if (tagSection) {
+                tagSection.scrollIntoView({ behavior: "smooth", block: "center" });
+                await sleep(2000); // Ngủ chờ scroll
+            }
+
+            let tagsToFill = row.tags;
+            if (!tagsToFill || tagsToFill.trim() === '') {
+                log('🔍 Tags trống. Gọi Gemini 2.5...');
+                const mockupUrl = row.images && row.images.length > 0 ? row.images[0] : null;
+                tagsToFill = await generateTagsWithGemini(row.title, mockupUrl);
+            }
+
+            const tagInput = document.querySelector(CONFIG.selectors.tagInput);
+            const tagAddBtn = document.querySelector(CONFIG.selectors.tagAddBtn);
+            if (tagsToFill && tagInput && tagAddBtn) {
+                const tagList = tagsToFill.split(',').map(t => t.trim()).filter(t => t).slice(0, 13);
+                log(`Nhập ${tagList.length} tags...`);
+
+                tagInput.focus(); tagInput.value = '';
+                await simulateTyping(tagInput, tagList.join(','), CONFIG.delay.typing);
+                await sleep(500);
+                tagInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+                await sleep(500);
+                tagAddBtn.click();
+                await sleep(CONFIG.delay.tagWait);
+            }
+            await sleep(getRandomMs(CONFIG.random.tags));
+
+            // 5. PUBLISH
+            log('Cuộn xuống nút Publish...');
+            window.scrollTo(0, document.body.scrollHeight);
+            await sleep(2000);
+
+            let mainPubBtn = await waitForSelector(CONFIG.selectors.publishBtn, 5000);
+            if (!mainPubBtn) throw new Error('Không thấy nút Publish chính');
+
+            let attempts = 0;
+            let savedIndex = false;
+            while (attempts < 60) {
+                // Check lỗi ảnh
+                if (checkImageError()) {
+                    log('⚠️ LỖI ẢNH! Scroll lên check...');
+                    const imgContainer = document.querySelector(CONFIG.selectors.imageContainer);
+                    if (imgContainer) {
+                        imgContainer.scrollIntoView({ behavior: "smooth", block: "center" });
+                        await sleep(2000);
+                    }
+
+                    log('♻️ Tải lại file...');
+                    const retryFiles = await fetchImagesAsFiles(row.images);
+                    if (retryFiles.length > 0) await uploadFilesToEtsy(retryFiles);
+                    await sleep(15000);
+
+                    log('👇 Scroll xuống lại...');
+                    window.scrollTo(0, document.body.scrollHeight);
+                    attempts = 0;
+                    if (mainPubBtn) simulateClick(mainPubBtn);
+                    await sleep(3000);
+                    continue;
+                }
+
+                // Check Confirm
+                const confirmBtn = findConfirmButton();
+                if (confirmBtn) {
+                    if (!savedIndex) { STATE.currentIndex = STATE.currentIndex + 1; savedIndex = true; }
+                    log(`👉 Click Confirm!`);
+                    simulateClick(confirmBtn);
+                } else {
+                    if (mainPubBtn) simulateClick(mainPubBtn);
+                }
+                await sleep(5000);
+                attempts++;
+            }
+            log('❌ Timeout Publish.');
+            STATE.isRunning = false;
+        } catch (e) {
+            console.error(e);
+            log('Lỗi: ' + e.message);
+            STATE.isRunning = false;
+        }
+    }
+
+    // --- HELPERS ---
+    function findConfirmButton() {
+        const overlayBtns = Array.from(document.querySelectorAll('div[role="dialog"] button, div[class*="overlay"] button'));
+        let targetBtn = overlayBtns.find(b => {
+            const txt = b.innerText.toLowerCase();
+            return (txt === 'publish' || txt === 'đăng' || txt === 'save' || txt === 'lưu') && b.offsetParent !== null;
+        });
+        if(targetBtn) return targetBtn;
+        const byId = document.querySelector('#shop-manager--listing-publish');
+        if(byId && byId.offsetParent !== null) return byId;
+        try {
+            const r = document.evaluate(CONFIG.selectors.confirmXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            if(r.singleNodeValue && r.singleNodeValue.offsetParent) return r.singleNodeValue;
+        } catch(e){}
+        return null;
+    }
+    function checkImageError() {
+        const err = document.querySelector(CONFIG.selectors.errorSummary);
+        const lnk = document.querySelector(CONFIG.selectors.photoErrorLink);
+        return (err && lnk && err.offsetParent !== null);
+    }
+    function getRandomMs(range) { return Math.floor(Math.random() * (range[1] - range[0] + 1)) + range[0]; }
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+    function simulateClick(element) {
+        if(!element) return;
+        element.focus(); element.click();
+        ['mousedown', 'mouseup', 'click'].forEach(evt => element.dispatchEvent(new MouseEvent(evt, { bubbles: true, cancelable: true, view: null })));
+    }
+    async function simulateTyping(input, text, speed) {
+        const proto = (input.tagName === 'TEXTAREA') ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+        for (let i = 1; i <= text.length; i++) {
+            setter.call(input, text.substring(0, i));
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            await new Promise(r => setTimeout(r, speed));
+        }
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    function waitForSelector(selector, timeout = 10000) {
+        return new Promise(resolve => {
+            if (document.querySelector(selector)) return resolve(document.querySelector(selector));
+            const obs = new MutationObserver(() => {
+                if (document.querySelector(selector)) { resolve(document.querySelector(selector)); obs.disconnect(); }
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => { obs.disconnect(); resolve(null); }, timeout);
+        });
+    }
+    async function fetchImagesAsFiles(urls) {
+        const promises = urls.map((url, i) => new Promise(resolve => {
+            GM_xmlhttpRequest({
+                method: "GET", url: url, responseType: "blob",
+                onload: r => resolve(r.status===200 ? new File([r.response], `img_${Date.now()}_${i}.jpg`, {type:"image/jpeg"}) : null),
+                onerror: () => resolve(null)
+            });
+        }));
+        return (await Promise.all(promises)).filter(f => f);
+    }
+    async function uploadFilesToEtsy(files) {
+        const inp = document.querySelector(CONFIG.selectors.fileInput);
+        if (!inp) return;
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        inp.files = dt.files;
+        inp.dispatchEvent(new Event('change', { bubbles: true }));
+        inp.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    createPanel();
+    setInterval(() => {
+        if (STATE.isRunning && document.querySelector('body')) {
+            const currentUrl = window.location.href;
+            if (!currentUrl.includes('listing-editor') && !window.isRedirecting) {
+                window.isRedirecting = true;
+                setTimeout(() => { window.location.href = `https://www.etsy.com/your/shops/me/listing-editor/copy/${STATE.templateId}`; }, 3000);
+            }
+        }
+    }, 2000);
+    window.addEventListener('load', () => { createPanel(); checkAndRedirect(); });
+
+})();
